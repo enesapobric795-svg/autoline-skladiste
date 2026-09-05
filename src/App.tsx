@@ -20,6 +20,7 @@ interface Part {
 export default function App() {
   const [parts, setParts] = useState<Part[]>([]);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState('');
   const [search, setSearch] = useState('');
 
   const [session, setSession] = useState<any>(null);
@@ -45,12 +46,16 @@ export default function App() {
 
   const [olxUsername, setOlxUsername] = useState('');
   const [olxPassword, setOlxPassword] = useState('');
+  const [olxToken, setOlxToken] = useState<string | null>(null);
   const [importingOlx, setImportingOlx] = useState(false);
 
   const [modalPart, setModalPart] = useState<Part | null>(null);
   const [olxTitle, setOlxTitle] = useState('');
   const [olxBrand, setOlxBrand] = useState('');
   const [olxCatNumber, setOlxCatNumber] = useState('');
+  const [olxListingId, setOlxListingId] = useState('');
+  const [olxCategoryId, setOlxCategoryId] = useState('');
+  const [olxListingType, setOlxListingType] = useState('sell');
   const [olxImage, setOlxImage] = useState<string | null>(null);
   const [publishingToOlx, setPublishingToOlx] = useState(false);
 
@@ -76,21 +81,31 @@ export default function App() {
 
   async function fetchParts() {
     setLoading(true);
+    setLoadError('');
     try {
-      const { data, error } = await supabase
-        .from('dijelovi')
-        .select('*')
-        .limit(50000);
+      const allParts: Part[] = [];
+      const pageSize = 1000;
 
-      if (!error) {
-        setParts((data || []) as unknown as Part[]);
-      } else {
-        console.error('Greška pri učitavanju:', error.message);
+      for (let from = 0; from < 50000; from += pageSize) {
+        const { data, error } = await supabase
+          .from('dijelovi')
+          .select('*')
+          .range(from, from + pageSize - 1);
+
+        if (error) throw error;
+
+        allParts.push(...((data || []) as unknown as Part[]));
+        if (!data || data.length < pageSize) break;
       }
+
+      setParts(allParts);
     } catch (err) {
       console.error(err);
+      setParts([]);
+      setLoadError('Podaci iz baze nisu mogli biti učitani. Provjerite internet i Supabase pravila pristupa.');
+    } finally {
+      setLoading(false);
     }
-    setLoading(false);
   }
 
   async function handleLogin(e: React.FormEvent) {
@@ -108,6 +123,7 @@ export default function App() {
   }
 
   async function handleLogout() {
+    setOlxToken(null);
     await supabase.auth.signOut();
   }
 
@@ -117,6 +133,14 @@ export default function App() {
       part['interna sifra'] ??
       ''
     ).trim();
+  }
+
+  function searchable(value: unknown) {
+    return String(value ?? '')
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .toLocaleLowerCase('bs-BA')
+      .trim();
   }
 
   async function uploadImage(file: File): Promise<string | null> {
@@ -144,7 +168,25 @@ export default function App() {
     }
   }
 
-  async function postToOlxApi(oglasData: { title: string; price: number; description: string; image: string | null }) {
+  async function postToOlxApi(oglasData: { title: string; price: number; description: string; image: string | null; category_id: string; listing_type: string }) {
+    function formatApiError(errorData: any, fallback: string) {
+      if (typeof errorData === 'string' && errorData.trim()) return errorData;
+      if (errorData?.message) {
+        return typeof errorData.message === 'string'
+          ? errorData.message
+          : JSON.stringify(errorData.message);
+      }
+      if (errorData?.error) {
+        return typeof errorData.error === 'string'
+          ? errorData.error
+          : JSON.stringify(errorData.error);
+      }
+      if (errorData && Object.keys(errorData).length > 0) {
+        return JSON.stringify(errorData);
+      }
+      return fallback;
+    }
+
     const clientId = import.meta.env.VITE_OLX_CLIENT_ID;
     const clientSecret = import.meta.env.VITE_OLX_CLIENT_SECRET;
 
@@ -156,26 +198,32 @@ export default function App() {
       throw new Error('Morate unijeti OLX korisničko ime i lozinku gore u formu za uvoz/podešavanja.');
     }
 
-    const authRes = await fetch('https://api.olx.ba/auth/login', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'OLX-CLIENT-ID': clientId,
-        'OLX-CLIENT-SECRET': clientSecret
-      },
-      body: JSON.stringify({
-        username: olxUsername,
-        password: olxPassword,
-        device_name: 'skladiste_app'
-      })
-    });
+    let token = olxToken;
+    if (!token) {
+      const authRes = await fetch('/olx-api/auth/login', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'OLX-CLIENT-ID': clientId,
+          'OLX-CLIENT-TOKEN': clientSecret
+        },
+        body: JSON.stringify({
+          username: olxUsername,
+          password: olxPassword,
+          device_name: 'skladiste_app'
+        })
+      });
 
-    const authData = await authRes.json();
-    if (!authRes.ok) throw new Error(authData.message || 'Greška pri OLX autentifikaciji.');
+      const authData = await authRes.json().catch(() => ({}));
+      if (!authRes.ok) {
+        throw new Error(formatApiError(authData, `OLX prijava nije uspjela (HTTP ${authRes.status}).`));
+      }
 
-    const token = authData.token;
+      token = authData.token;
+      setOlxToken(token);
+    }
 
-    const response = await fetch('https://api.olx.ba/listings', {
+    const response = await fetch('/olx-api/listings', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -184,15 +232,37 @@ export default function App() {
       body: JSON.stringify({
         title: oglasData.title,
         price: oglasData.price,
+        category_id: Number(oglasData.category_id),
+        listing_type: oglasData.listing_type,
         description: oglasData.description,
         image: oglasData.image
       })
     });
 
+    const result = await response.json().catch(() => ({}));
     if (!response.ok) {
-      const errRes = await response.json().catch(() => ({}));
-      throw new Error(errRes.message || 'Greška prilikom objavljivanja na OLX API.');
+      const errRes = result;
+      throw new Error(formatApiError(errRes, `Greška prilikom objavljivanja na OLX API (HTTP ${response.status}).`));
     }
+
+    const listing = result?.data || result;
+    const listingId = listing?.id || listing?.listing_id;
+    if (!listingId) {
+      throw new Error(`OLX nije vratio ID kreiranog oglasa. Odgovor API-ja: ${JSON.stringify(result)}`);
+    }
+
+    const profileResponse = await fetch(
+      `/olx-api/users/${encodeURIComponent(olxUsername)}/listings?q=${encodeURIComponent(oglasData.title)}&page=1`
+    );
+    const profileResult = await profileResponse.json().catch(() => ({}));
+    const profileListings = Array.isArray(profileResult?.data) ? profileResult.data : [];
+    const appearsOnProfile = profileListings.some((item: any) => String(item.id) === String(listingId));
+    return {
+      id: String(listingId),
+      appearsOnProfile,
+      status: listing?.status || 'pending',
+      visible: listing?.visible ?? false
+    };
   }
 
   function openOlxModal(part: Part) {
@@ -200,11 +270,29 @@ export default function App() {
     setOlxTitle(part.naziv || '');
     setOlxBrand(part['marka vozila'] || '');
     setOlxCatNumber(part['kataloški broj'] || '');
+    setOlxListingId(part.id || '');
+    setOlxCategoryId('936');
+    setOlxListingType('sell');
     setOlxImage(part.slika || null);
   }
 
   async function handleConfirmOlxPublish() {
     if (!olxTitle) return alert('Naslov oglasa je obavezan!');
+    if (!olxListingId.trim()) return alert('ID oglasa je obavezan!');
+    if (!olxCategoryId.trim() || !/^\d+$/.test(olxCategoryId.trim())) {
+      return alert('Kategorija oglasa je obavezna i mora biti broj (category ID).');
+    }
+    if (!olxListingType) return alert('Vrsta oglasa je obavezna.');
+
+    const categoryResponse = await fetch(`/olx-api/categories/${olxCategoryId.trim()}`);
+    const categoryResult = await categoryResponse.json().catch(() => ({}));
+    if (!categoryResponse.ok) {
+      return alert(`Kategorija nije pronađena (HTTP ${categoryResponse.status}).`);
+    }
+    const category = categoryResult.data;
+    if (Array.isArray(category) || category?.sub_categories?.length > 0) {
+      return alert('Ovaj ID nije krajnja OLX kategorija. Unesite ID podkategorije bez dodatnih podkategorija.');
+    }
     
     const finalDescription = 
       `Naziv: ${olxTitle}\n` +
@@ -213,13 +301,18 @@ export default function App() {
 
     setPublishingToOlx(true);
     try {
-      await postToOlxApi({
+      const createdListing = await postToOlxApi({
         title: olxTitle,
         price: 0,
+        category_id: olxCategoryId.trim(),
+        listing_type: olxListingType,
         description: finalDescription,
         image: olxImage
       });
-      alert(`Artikal "${olxTitle}" uspješno objavljen na OLX/PIK!`);
+      const visibilityMessage = createdListing.appearsOnProfile
+        ? 'Oglas je vidljiv na profilu.'
+        : 'OLX ga je prihvatio, ali još nije vidljiv na javnom profilu. Provjerite status u OLX nalogu.';
+      alert(`Artikal "${olxTitle}" je prihvaćen.\nID oglasa: ${createdListing.id}\nStatus: ${createdListing.status}\n${visibilityMessage}\n\nLink: https://olx.ba/artikal/${createdListing.id}`);
       setModalPart(null);
     } catch (err: any) {
       alert('Greška pri objavi: ' + err.message);
@@ -319,12 +412,12 @@ export default function App() {
 
     setImportingOlx(true);
     try {
-      const authRes = await fetch('https://api.olx.ba/auth/login', {
+      const authRes = await fetch('/olx-api/auth/login', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           'OLX-CLIENT-ID': clientId,
-          'OLX-CLIENT-SECRET': clientSecret
+          'OLX-CLIENT-TOKEN': clientSecret
         },
         body: JSON.stringify({
           username: olxUsername,
@@ -333,8 +426,10 @@ export default function App() {
         })
       });
 
-      const authData = await authRes.json();
-      if (!authRes.ok) throw new Error(authData.message || 'Neuspješna prijava na OLX.');
+      const authData = await authRes.json().catch(() => ({}));
+      if (!authRes.ok) {
+        throw new Error(authData.message || authData.error || `OLX prijava nije uspjela (HTTP ${authRes.status}).`);
+      }
 
       const token = authData.token;
       let page = 1;
@@ -343,7 +438,7 @@ export default function App() {
       let hasMore = true;
 
       while (hasMore) {
-        const listRes = await fetch(`https://api.olx.ba/listings?page=${page}`, {
+        const listRes = await fetch(`/olx-api/listings?page=${page}`, {
           method: 'GET',
           headers: {
             'Content-Type': 'application/json',
@@ -405,12 +500,13 @@ export default function App() {
   ).sort();
 
   const filteredParts = parts.filter((p) => {
-    const code = getInternalCode(p).toLowerCase();
+    const query = searchable(search);
+    const code = searchable(getInternalCode(p));
     const matchSearch =
-      p.naziv?.toLowerCase().includes(search.toLowerCase()) ||
-      p['kataloški broj']?.toLowerCase().includes(search.toLowerCase()) ||
-      code.includes(search.toLowerCase()) ||
-      p['marka vozila']?.toLowerCase().includes(search.toLowerCase());
+      searchable(p.naziv).includes(query) ||
+      searchable(p['kataloški broj']).includes(query) ||
+      code.includes(query) ||
+      searchable(p['marka vozila']).includes(query);
 
     const matchBrand = selectedBrand === '' || p['marka vozila'] === selectedBrand;
     return matchSearch && matchBrand;
@@ -554,7 +650,11 @@ export default function App() {
         </div>
 
         {/* KARTICE ARTIKALA */}
-        {loading ? (
+        {loadError ? (
+          <div style={{ textAlign: 'center', padding: '20px', backgroundColor: '#fef2f2', borderRadius: '16px', border: '1px solid #fecaca', color: '#b91c1c' }}>
+            {loadError}
+          </div>
+        ) : loading ? (
           <div style={{ textAlign: 'center', padding: '40px', color: '#64748b' }}>Učitavanje artikala...</div>
         ) : filteredParts.length === 0 ? (
           <div style={{ textAlign: 'center', padding: '40px', backgroundColor: 'white', borderRadius: '16px', border: '1px solid #e2e8f0', color: '#64748b' }}>Nema pronađenih artikala.</div>
@@ -587,7 +687,7 @@ export default function App() {
 
                     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 'auto', paddingTop: '12px', borderTop: '1px solid #f1f5f9' }}>
                       <span style={{ fontSize: '12px', color: '#64748b' }}>Cijena:</span>
-                      <span style={{ fontSize: '18px', fontWeight: '800', color: '#2563eb' }}>{(part.cijena || 0).toFixed(2)} KM</span>
+                      <span style={{ fontSize: '18px', fontWeight: '800', color: '#2563eb' }}>{Number(part.cijena || 0).toFixed(2)} KM</span>
                     </div>
 
                     <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px', marginTop: '6px' }}>
@@ -629,6 +729,24 @@ export default function App() {
               <input type="text" value={olxCatNumber} onChange={(e) => setOlxCatNumber(e.target.value)} style={baseInputStyle} />
             </div>
 
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+              <label style={{ fontSize: '12px', fontWeight: '600', color: '#475569' }}>ID oglasa:</label>
+              <input type="text" value={olxListingId} onChange={(e) => setOlxListingId(e.target.value)} style={baseInputStyle} />
+            </div>
+
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+              <label style={{ fontSize: '12px', fontWeight: '600', color: '#475569' }}>Vrsta oglasa:</label>
+              <select value={olxListingType} onChange={(e) => setOlxListingType(e.target.value)} style={baseInputStyle}>
+                <option value="sell">Prodaja</option>
+                <option value="buy">Potražnja</option>
+              </select>
+            </div>
+
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+              <label style={{ fontSize: '12px', fontWeight: '600', color: '#475569' }}>Kategorija oglasa (ID):</label>
+              <input type="number" min="1" placeholder="Npr. 123" value={olxCategoryId} onChange={(e) => setOlxCategoryId(e.target.value)} style={baseInputStyle} />
+            </div>
+
             {olxImage && (
               <div style={{ display: 'flex', alignItems: 'center', gap: '12px', backgroundColor: '#f8fafc', padding: '10px', borderRadius: '10px', border: '1px solid #e2e8f0' }}>
                 <img src={olxImage} alt="" style={{ width: '45px', height: '45px', objectFit: 'cover', borderRadius: '8px' }} />
@@ -647,7 +765,6 @@ export default function App() {
           </div>
         </div>
       )}
-
     </div>
   );
 }
